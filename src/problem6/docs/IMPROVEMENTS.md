@@ -14,7 +14,7 @@ the module carries anything valuable.
 
 ## 1. Improvements to the design as specified
 
-### P0 — Move authority over the action to the server
+### P0: Move authority over the action to the server
 
 *The single change that converts requirement 5 from "mitigated" to "solved".*
 
@@ -41,7 +41,7 @@ upgrade is a swap of one check, not a rewrite. That is deliberate.
 it is the difference between a leaderboard that can be trusted and one that can
 only be watched.
 
-### P1 — Ledger partitioning from day one
+### P1: Ledger partitioning from day one
 
 At the assumed 10^3 increments/second, `score_events` grows by roughly 17 GB per
 day. Monthly range partitioning costs an hour to set up now. Retrofitting it
@@ -52,14 +52,14 @@ This is the least visible and most certain problem in the specification: nothing
 misbehaves for the first few months, and then vacuum, index maintenance and
 retention all become difficult at once.
 
-### P1 — A dedicated non-production key for the action-token HMAC
+### P1: A dedicated non-production key for the action-token HMAC
 
 Obvious, and routinely missed. If staging and production share a key, a leak
 from the environment with weaker access controls is a production compromise
 (T-14). Separate keys, separate secret-manager paths, and a boot-time assertion
 that the production key is not the staging one.
 
-### P2 — Extract the stream tier
+### P2: Extract the stream tier
 
 Holding 10^5 sockets and serving HTTP requests scale on different axes: one is
 bound by memory and network egress, the other by CPU. A dedicated push service —
@@ -70,7 +70,7 @@ them, and stops an API deploy from disconnecting every viewer.
 second deployable to build, monitor and page for, in exchange for headroom that
 is not yet needed.
 
-### P2 — Event sourcing for the score, not just an audit ledger
+### P2: Event sourcing for the score, not just an audit ledger
 
 `score_events` is already an event log. Promoting it to the *only* source of
 truth, with `user_scores` demoted to a pure projection, buys: point-in-time
@@ -82,7 +82,7 @@ harder mental model for the team.
 Worth doing **if** leaderboard history becomes a product requirement. Not worth
 doing for its own sake.
 
-### P2 — Seasons, decay, or both
+### P2: Seasons, decay, or both
 
 An all-time board becomes a monument. Once the top 10 stops changing, the *live*
 requirement has nothing left to deliver and the feature quietly dies. Weekly or
@@ -92,7 +92,7 @@ The design already anticipates this: `scoreboard:{scope}` in §6.3 and the ledge
 in §6.1 make an additional board a new projection over existing data, with no
 change to the write path.
 
-### P3 — Smaller items
+### P3: Smaller items
 
 | Item | Why |
 |------|-----|

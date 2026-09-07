@@ -126,13 +126,21 @@ The module is a **live top-10 scoreboard** — PostgreSQL as the system of recor
 a Redis read model kept current by a transactional outbox and a projector, and
 SSE for live delivery.
 
-**[Full specification →](src/problem6)** · ~2,900 lines across four documents:
-the [specification](src/problem6/README.md), 12
-[decision records](src/problem6/docs/DECISIONS.md), a
-[threat model](src/problem6/docs/THREAT_MODEL.md), and an
-[OpenAPI 3.1 contract](src/problem6/docs/openapi.yaml). Six Mermaid diagrams,
-all verified by rendering; every `$ref` in the OpenAPI file and every internal
-link resolves.
+**[Full specification →](src/problem6)** · ~3,900 lines across six documents,
+each written for a named audience — because a specification that only its author
+can read has not been delivered:
+
+| Document | For |
+|---|---|
+| [Specification](src/problem6/README.md) | Deciding whether the design is right |
+| [Implementation guide](src/problem6/docs/IMPLEMENTATION_GUIDE.md) | Whoever writes the code — interfaces, tickets, and the seven mistakes that fail silently |
+| [Glossary](src/problem6/docs/GLOSSARY.md) | Anyone — every assumed term defined once |
+| [Decision records](src/problem6/docs/DECISIONS.md) | Reviewers, and whoever revisits this later |
+| [Threat model](src/problem6/docs/THREAT_MODEL.md) | Security review |
+| [OpenAPI 3.1 contract](src/problem6/docs/openapi.yaml) | Clients and contract tests |
+
+Six Mermaid diagrams, all verified by rendering; every `$ref` in the OpenAPI
+file and all 100+ internal links resolve.
 
 The document is built around one finding, stated in its first section:
 

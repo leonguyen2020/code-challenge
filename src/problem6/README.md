@@ -38,14 +38,22 @@ and failure mode below is normative unless explicitly marked as an option.
 [Definition of done](#12-definition-of-done) · [Delivery](#13-delivery-plan) ·
 [Improvements](#14-comments-for-improvement)
 
+> **Implementing this, and something here is unfamiliar?** Start with
+> [`docs/GLOSSARY.md`](docs/GLOSSARY.md), then
+> [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTATION_GUIDE.md). This document
+> is written for the person deciding whether the design is right; those two are
+> written for the person building it. Nothing below assumes you skipped them.
+
 Supporting documents:
 
-| Document | Contents |
-|----------|----------|
-| [`docs/DECISIONS.md`](docs/DECISIONS.md) | 12 architecture decision records — the options considered and why each was rejected |
-| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | STRIDE analysis, attack tree, threats with controls and residual risk |
-| [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) | Prioritised improvements, explicit non-goals, open questions for the product owner |
-| [`docs/openapi.yaml`](docs/openapi.yaml) | Machine-readable contract — the normative source for request and response shapes |
+| Document | Written for | Contents |
+|----------|-------------|----------|
+| [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTATION_GUIDE.md) | Whoever writes the code | Domain interfaces, ticket breakdown, and the seven mistakes that fail silently — with the wrong version and the right one side by side |
+| [`docs/GLOSSARY.md`](docs/GLOSSARY.md) | Anyone | Every assumed term defined once, in plain language, linked to where it is used |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Reviewers, and whoever revisits this later | 12 architecture decision records — the options considered and why each was rejected |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Security review | STRIDE analysis, attack tree, threats with controls and residual risk |
+| [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) | The product owner | Prioritised improvements, explicit non-goals, open questions |
+| [`docs/openapi.yaml`](docs/openapi.yaml) | Clients and contract tests | Machine-readable contract — the normative source for request and response shapes |
 
 ---
 
@@ -242,7 +250,7 @@ projection lag becomes the bottleneck (§14.3).
 
 ## 4. Execution flow
 
-### 4.1 The main flow — action completion to live board
+### 4.1 The main flow: action completion to live board
 
 This is the required flow-of-execution diagram. The numbered steps are normative
 and are referenced elsewhere in this document.
@@ -607,7 +615,7 @@ driver errors carry table names, SQL fragments and sometimes row values.
 
 ## 6. Data model
 
-### 6.1 PostgreSQL — the system of record
+### 6.1 PostgreSQL: the system of record
 
 Written as hand-authored, reversible migrations. `synchronize` stays `false`
 permanently and migrations are a deployment step, never run on process boot —
@@ -745,7 +753,7 @@ produce 409s for operations that are perfectly safe to interleave.
 statement, no race, no branch, and it works correctly the first time a user ever
 scores.
 
-### 6.3 Redis — the read model
+### 6.3 Redis: the read model
 
 | Key | Type | Contents | TTL |
 |-----|------|----------|-----|
@@ -890,7 +898,7 @@ snapshot fetched on reconnect. If the board ever needs guaranteed delivery — f
 an audit feed, say — Redis Streams with consumer groups is the replacement, at
 the cost of managing consumer state.
 
-### 7.3 Broadcast throttling — the part that decides whether this scales
+### 7.3 Broadcast throttling: the part that decides whether this scales
 
 **Do not broadcast on every increment.** Two independent filters, both required:
 
@@ -1005,7 +1013,7 @@ points and not a silent success. The catalogue is loaded at boot and validated;
 a missing or malformed catalogue prevents the process from starting, the same
 fail-fast configuration policy Problem 5 applies to credentials.
 
-### 8.3 Action tokens — binding the award to a real flow
+### 8.3 Action tokens: binding the award to a real flow
 
 Without this, `POST /score-increments` is a bare "give me points" endpoint that
 any authenticated user can call in a loop. The action token forces the caller
@@ -1226,7 +1234,7 @@ implementation that gets shipped when the read model is skipped as "premature".
 At 10^6 rows with an index it still costs a sort of the candidate set on every
 page load; at 10^5 viewers per minute it is the whole database.
 
-### 10.3 Fan-out arithmetic — the constraint that actually binds
+### 10.3 Fan-out arithmetic: the constraint that actually binds
 
 A top-10 snapshot with rank, id, display name and score is roughly **1 KB**
 serialised.

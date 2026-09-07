@@ -83,7 +83,7 @@ forge their apparent IP defeats the per-IP components of anomaly detection.
 
 ---
 
-## 3. Attack tree — "increase my score without doing the work"
+## 3. Attack tree: "increase my score without doing the work"
 
 The primary abuse case. Leaf nodes are marked with whether the design stops
 them.
