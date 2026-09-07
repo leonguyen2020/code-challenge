@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    /* CommonJS via the Node16 resolver. TypeORM's CLI and its decorator
+       metadata are still most reliable under CommonJS, and Node16 replaces the
+       deprecated node10 resolver. */
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "rootDir": ".",
+    "outDir": "dist",
+
+    /* TypeORM uses *legacy* decorators, not the TC39 decorators TypeScript 5
+       enables by default. */
+    "experimentalDecorators": true,
+    /* emitDecoratorMetadata is deliberately OFF. It exists so @Column() can
+       infer a database type from the TypeScript type, but every column in this
+       codebase declares its `type` explicitly - which is better practice anyway,
+       since the mapping from `number` to int4/int8/numeric is a decision worth
+       making on purpose. Leaving it on emits a `typeof Date !== "undefined" ?
+       Date : Object` guard per Date-typed property, whose fallback branch is
+       unreachable and can never be covered by any test. */
+    "emitDecoratorMetadata": false,
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "declaration": false,
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    /* Required by ts-jest under the Node16 module mode, and a good constraint
+       regardless: it forbids constructs that cannot be compiled one file at a
+       time, which is what every modern bundler and transpiler does. */
+    "isolatedModules": true,
+    "esModuleInterop": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

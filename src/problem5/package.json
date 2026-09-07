@@ -1,0 +1,52 @@
+{
+  "name": "@code-challenge/problem5",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Problem 5 - A Crude Server. ExpressJS + TypeScript CRUD over a product inventory.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "clean": "rm -rf dist coverage *.tsbuildinfo",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "jest",
+    "test:unit": "jest --selectProjects unit",
+    "test:integration": "jest --selectProjects integration",
+    "test:coverage": "jest --coverage",
+    "migration:run": "typeorm-ts-node-commonjs migration:run -d src/infrastructure/typeorm/dataSource.ts",
+    "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/infrastructure/typeorm/dataSource.ts",
+    "migration:show": "typeorm-ts-node-commonjs migration:show -d src/infrastructure/typeorm/dataSource.ts",
+    "seed": "tsx src/infrastructure/typeorm/seed.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.0.1",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^0.3.20",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.0.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/supertest": "^6.0.2",
+    "jest": "^30.0.0",
+    "supertest": "^7.0.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
