@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Redis configuration template. `__REDIS_PASSWORD__` is substituted at
+# container start-up so the secret never appears on the process command line.
+# ---------------------------------------------------------------------------
+
+bind 0.0.0.0
+port 6379
+
+# Refuse connections that have not authenticated. Combined with the loopback
+# port publishing in docker-compose.yml this gives defence in depth.
+protected-mode yes
+requirepass __REDIS_PASSWORD__
+
+# --- Persistence ------------------------------------------------------------
+# AOF with per-second fsync: at most one second of writes is lost on a crash,
+# which is the right trade-off for a leaderboard/cache workload.
+appendonly yes
+appendfsync everysec
+dir /data
+
+# RDB snapshots as a secondary, cheap-to-restore backup.
+save 900 1
+save 300 10
+save 60 10000
+
+# --- Memory safety ----------------------------------------------------------
+# Hard cap so a runaway writer cannot exhaust host memory (availability / DoS
+# protection). allkeys-lru keeps the most useful data when the cap is hit.
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+
+# --- Hardening --------------------------------------------------------------
+# Disable commands that let a client reconfigure the server, read arbitrary
+# files, or wipe the dataset. Renaming to "" removes them entirely.
+rename-command CONFIG ""
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command DEBUG ""
+rename-command MODULE ""
+
+# Bound client resources.
+maxclients 200
+timeout 300
+tcp-keepalive 300
+
+loglevel notice

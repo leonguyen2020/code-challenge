@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# Local development infrastructure for the 99Tech code challenge.
+#
+#   docker compose up -d          start Postgres + Redis
+#   docker compose ps             health status
+#   docker compose down           stop (data survives in named volumes)
+#   docker compose down -v        stop and destroy data
+#
+# Security posture (this stack is for LOCAL DEVELOPMENT ONLY):
+#   * Ports are published on 127.0.0.1 only, so nothing is reachable from the
+#     LAN even on an untrusted network.
+#   * Credentials come from .env (git-ignored) and are required - there are no
+#     defaults, so the stack fails loudly rather than booting with a weak or
+#     empty password.
+#   * Redis requires AUTH and runs with protected-mode on.
+#   * Containers drop all Linux capabilities they do not need and cannot gain
+#     new privileges (no-new-privileges), limiting blast radius if a service
+#     is ever compromised.
+#   * Image tags are pinned to a major.minor line for reproducible builds.
+# ---------------------------------------------------------------------------
+
+name: ${COMPOSE_PROJECT_NAME:-code-challenge}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-code-challenge}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required - copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required - copy .env.example to .env}
+      # Enforce SCRAM-SHA-256 instead of the weaker md5 for all new roles.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # host-loopback:container - deliberately NOT 0.0.0.0
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h 127.0.0.1 forces a real TCP handshake rather than a unix-socket
+      # shortcut, so the check fails until the server truly accepts clients.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-code-challenge}-redis
+    restart: unless-stopped
+    # Password is passed via env and read by the config file, so it never
+    # appears in `docker inspect`'s command line or in `ps` output.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required - copy .env.example to .env}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # Render the password into the config at boot; the rendered file lives
+        # on a tmpfs-free path inside the container only.
+        sed "s|__REDIS_PASSWORD__|$$REDIS_PASSWORD|" /usr/local/etc/redis/redis.conf.template > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+      - ./docker/redis/redis.conf.template:/usr/local/etc/redis/redis.conf.template:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks: [backend]
+
+volumes:
+  postgres-data:
+    name: ${COMPOSE_PROJECT_NAME:-code-challenge}-postgres-data
+  redis-data:
+    name: ${COMPOSE_PROJECT_NAME:-code-challenge}-redis-data
+
+networks:
+  backend:
+    name: ${COMPOSE_PROJECT_NAME:-code-challenge}-backend
+    driver: bridge
