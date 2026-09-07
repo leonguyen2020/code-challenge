@@ -1,0 +1,593 @@
+openapi: 3.1.0
+
+info:
+  title: Scoreboard Module API
+  version: 1.0.0
+  summary: Live top-10 scoreboard with authenticated, non-forgeable score increments.
+  description: |
+    Normative request and response contract for the scoreboard module.
+    The prose specification is in `../README.md`; where the two disagree, this
+    file is authoritative for shapes and status codes, and the README is
+    authoritative for behaviour.
+
+    Two rules govern the whole surface and are worth stating before any schema:
+
+    1. **The caller never supplies its own identity.** The scored user is the
+       `sub` claim of the verified access token. No request body, query
+       parameter or header may carry a user id.
+    2. **The caller never supplies a point value.** Points are resolved
+       server-side from the action catalogue, keyed by the action type carried
+       inside the signed action token.
+
+    Requests that violate either rule are rejected with `400 VALIDATION_FAILED`
+    rather than having the offending field ignored.
+  license:
+    name: MIT
+  contact:
+    name: Scoreboard module owners
+
+servers:
+  - url: https://api.example.com/api/v1
+    description: Production
+  - url: http://localhost:3000/api/v1
+    description: Local development
+
+tags:
+  - name: actions
+    description: The two-step flow that binds a score award to a real action.
+  - name: scoreboard
+    description: Reading the board, live and on demand.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /actions/start:
+    post:
+      tags: [actions]
+      operationId: startAction
+      summary: Begin an action and mint a single-use action token
+      description: |
+        Step one of the two-step award flow. Returns an opaque, HMAC-signed
+        token bound to the authenticated user, the action type and the issue
+        time. The token is single-use and short-lived.
+
+        The token exists so that a score award cannot be produced by replaying
+        one captured request. It does not prove a human performed the action —
+        see `docs/THREAT_MODEL.md` §6 for the residual risk this leaves open.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartActionRequest'
+      responses:
+        '201':
+          description: Token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartActionResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/UnknownActionType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/WriteUnavailable' }
+
+  /score-increments:
+    post:
+      tags: [actions]
+      operationId: recordScoreIncrement
+      summary: Report action completion and award points
+      description: |
+        Step two. Verifies the action token, consumes it exactly once, resolves
+        the point value server-side, and commits the award.
+
+        Returns `202 Accepted`, not `200 OK`: the score is durably committed
+        when this responds, but the public board is updated asynchronously by
+        the projector. `totalScore` is authoritative — it is read back from the
+        write transaction. `rank` and `boardVersion` are best-effort and may lag
+        by the projector latency.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScoreIncrementRequest'
+      responses:
+        '202':
+          description: Award committed.
+          headers:
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoreIncrementResponse'
+        '200':
+          description: |
+            Idempotent replay. The original response is returned unchanged;
+            no additional points were awarded.
+          headers:
+            Idempotency-Replayed:
+              description: Always `true` on a replay.
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoreIncrementResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/ForbiddenActionToken' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ActionTooFast' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/WriteUnavailable' }
+
+  /scoreboard/top:
+    get:
+      tags: [scoreboard]
+      operationId: getTopScores
+      summary: Current top 10
+      description: |
+        Served from a pre-rendered snapshot: one Redis `GET`, no sorting, no
+        join, no database access. Cacheable for one second, which lets a CDN
+        absorb an unbounded anonymous audience.
+
+        There is no `limit` parameter. The board is the top 10; an endpoint
+        that will return the top 100,000 on request is a denial-of-service
+        primitive with a friendly name.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: The current board.
+          headers:
+            ETag:
+              description: The board version. Use with `If-None-Match`.
+              schema: { type: string }
+            Cache-Control:
+              description: '`public, max-age=1, stale-while-revalidate=5`'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Scoreboard'
+        '304':
+          description: Not modified — the board version is unchanged.
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /scoreboard/stream:
+    get:
+      tags: [scoreboard]
+      operationId: streamScoreboard
+      summary: Live board over Server-Sent Events
+      description: |
+        A `text/event-stream` connection. The current snapshot is sent
+        immediately on connect, so no separate fetch is needed to render.
+
+        Every message carries the **complete** top 10, never a delta. Redis
+        Pub/Sub is at-most-once, so a delta stream would diverge permanently on
+        a dropped message; a snapshot stream repairs itself on the next
+        broadcast and needs no gap-recovery protocol. `Last-Event-ID` is
+        therefore an optimisation, not a requirement.
+
+        Broadcasts are throttled to at most one per second and are suppressed
+        entirely when the top 10 has not changed.
+
+        Response headers include `X-Accel-Buffering: no`; without it a
+        buffering reverse proxy delivers events in bursts and the board is not
+        live in any useful sense.
+      security: []
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Board version last received. Sent automatically by `EventSource` on reconnect.
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            An open event stream. Events are named `board`; the data payload of
+            each is a `Scoreboard` object. Lines beginning with `:` are
+            keepalive comments, emitted every 20 seconds.
+          content:
+            text/event-stream:
+              schema: { type: string }
+              examples:
+                board:
+                  summary: Two board events separated by a keepalive
+                  value: |
+                    retry: 3000
+
+                    id: 4711
+                    event: board
+                    data: {"version":4711,"generatedAt":"2026-09-07T10:34:00.000Z","entries":[{"rank":1,"userId":"018f3a2b-7c4e-7a91-9f3c-2b5d8e1a4c60","displayName":"kaya","score":9820}]}
+
+                    : keepalive
+
+                    id: 4712
+                    event: board
+                    data: {"version":4712,"generatedAt":"2026-09-07T10:34:12.500Z","entries":[{"rank":1,"userId":"018f3a2b-7c4e-7a91-9f3c-2b5d8e1a4c60","displayName":"kaya","score":9870}]}
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: |
+            This instance is at its connection cap. Retry against another
+            instance after `Retry-After` seconds. An instance that accepted
+            connections past the point where it can serve them would fail all
+            of them instead of some.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /scoreboard/me:
+    get:
+      tags: [scoreboard]
+      operationId: getMyRank
+      summary: The caller's own score, rank and immediate neighbours
+      description: |
+        Rank is `ZREVRANK`, O(log N). The neighbours cost one extra range read
+        and answer the question a user outside the top 10 actually has, which is
+        how far away the next place is.
+      responses:
+        '200':
+          description: The caller's standing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyRank'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token issued by the identity service. Verified against its JWKS
+        using an **algorithm whitelist** — the `alg` header of the token is
+        never trusted to select the verification algorithm, which is how
+        `alg: none` and RS256-to-HS256 confusion attacks succeed. `iss`, `aud`,
+        `exp` and `nbf` are all verified, with at most 60 seconds of clock skew.
+
+        The `sub` claim is the **only** source of the scored user's identity.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A client-generated UUID identifying this logical award. **Required.**
+
+        Replaying the same key with the same body returns the original response
+        with `200`; replaying it with a different body is `409`. Enforced by a
+        unique index in PostgreSQL, not only by a cache lookup — a cache
+        narrows the race window, an index closes it.
+      schema:
+        type: string
+        format: uuid
+      example: 018f3a2b-7c4e-7a91-9f3c-2b5d8e1a4c60
+
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: Board version previously received. Yields `304` when unchanged.
+      schema: { type: string }
+
+  headers:
+    RateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema: { type: integer }
+
+  schemas:
+
+    StartActionRequest:
+      type: object
+      additionalProperties: false
+      required: [actionType]
+      properties:
+        actionType:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{2,63}$'
+          description: Must exist in the server-side action catalogue.
+          example: daily_challenge
+
+    StartActionResponse:
+      type: object
+      required: [actionToken, actionType, expiresAt, minDurationMs]
+      properties:
+        actionToken:
+          type: string
+          description: |
+            Opaque to the client. Internally `v1.<payload>.<hmac>`, binding
+            `jti`, `sub`, `actionType`, `iat` and the catalogue version.
+          example: v1.eyJqdGkiOiIwMWo5In0.9f2c1a7b4e
+        actionType:
+          type: string
+          example: daily_challenge
+        expiresAt:
+          type: string
+          format: date-time
+        minDurationMs:
+          type: integer
+          minimum: 0
+          description: |
+            The shortest time in which this action can plausibly be completed.
+            Returned so an honest client can avoid a pointless rejection; it is
+            enforced server-side regardless, and this copy is advisory.
+          example: 3000
+
+    ScoreIncrementRequest:
+      type: object
+      additionalProperties: false
+      required: [actionToken]
+      properties:
+        actionToken:
+          type: string
+          description: The token issued by `POST /actions/start`.
+      description: |
+        Note the two fields that are absent by design: `userId` and `points`.
+        `additionalProperties: false` makes sending either a `400`, which is the
+        mass-assignment defence on the one endpoint where mass assignment would
+        be worth money. Unknown fields are rejected rather than dropped —
+        silently ignoring them trains clients to send them and hides a probing
+        attacker in the noise.
+
+    ScoreIncrementResponse:
+      type: object
+      required: [userId, pointsAwarded, totalScore, appliedAt]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        pointsAwarded:
+          type: integer
+          minimum: 1
+          description: Resolved from the server-side catalogue.
+        totalScore:
+          type: integer
+          format: int64
+          description: Authoritative — returned by the write transaction.
+        rank:
+          type: integer
+          minimum: 1
+          description: |
+            Best-effort. Read from the read model, which may lag the write by
+            the projector latency. A client that renders this as though it were
+            transactional will briefly disagree with the board.
+        appliedAt:
+          type: string
+          format: date-time
+        boardVersion:
+          type: integer
+          description: Best-effort, as for `rank`.
+
+    ScoreboardEntry:
+      type: object
+      required: [rank, userId, displayName, score]
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+          maximum: 10
+        userId:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+          maxLength: 64
+        score:
+          type: integer
+          format: int64
+
+    Scoreboard:
+      type: object
+      required: [version, generatedAt, entries]
+      properties:
+        version:
+          type: integer
+          description: Monotonic board version. Also the `ETag` and the SSE event id.
+        generatedAt:
+          type: string
+          format: date-time
+        entries:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ScoreboardEntry'
+      description: |
+        Ties are broken by who reached the score first (assumption A3). Users
+        who have opted out of the public board are absent from the ranking
+        entirely — they are removed from the read model rather than filtered at
+        read time, so no code path can leak them by forgetting the filter.
+
+    MyRank:
+      type: object
+      required: [userId, score, rank]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        score:
+          type: integer
+          format: int64
+        rank:
+          type: integer
+          minimum: 1
+        neighbours:
+          type: array
+          description: The entries immediately above and below the caller.
+          items:
+            $ref: '#/components/schemas/ScoreboardEntry'
+
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem document, matching the convention already used in
+        Problem 5. Clients branch on `code`, never on prose: `code` is API
+        surface and may not be reworded once published.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          example: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          description: Stable, machine-readable error identifier.
+          enum:
+            - VALIDATION_FAILED
+            - MALFORMED_JSON
+            - IDEMPOTENCY_KEY_MISSING
+            - UNAUTHENTICATED
+            - TOKEN_EXPIRED
+            - INVALID_ACTION_TOKEN
+            - ACTION_TOKEN_MISMATCH
+            - ACCOUNT_SUSPENDED
+            - USER_NOT_FOUND
+            - ROUTE_NOT_FOUND
+            - ACTION_ALREADY_CLAIMED
+            - IDEMPOTENCY_KEY_REUSED
+            - UNSUPPORTED_MEDIA_TYPE
+            - ACTION_TOO_FAST
+            - UNKNOWN_ACTION_TYPE
+            - RATE_LIMITED
+            - VELOCITY_EXCEEDED
+            - WRITE_UNAVAILABLE
+            - INTERNAL_ERROR
+        instance:
+          type: string
+        requestId:
+          type: string
+          format: uuid
+          description: Correlates the response with the server log line.
+        issues:
+          type: array
+          description: Field-level validation problems. Never echoes the submitted value.
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path: { type: string }
+              message: { type: string }
+
+  responses:
+
+    BadRequest:
+      description: |
+        Malformed request, failed schema validation, or a missing
+        `Idempotency-Key`. Also returned when the body contains `userId` or
+        `points` — those fields are rejected, never ignored.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    Unauthenticated:
+      description: Missing, malformed, expired or unverifiable access token.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    ForbiddenActionToken:
+      description: |
+        The action token is invalid, expired, or was issued to a different user.
+
+        These cases are not distinguished any more precisely than the `code`
+        allows, and the submitted token is never echoed back — both would be
+        reconnaissance. `ACTION_TOKEN_MISMATCH` additionally raises a security
+        alert: presenting another user's token has no innocent cause.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    NotFound:
+      description: No such user or route.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    Conflict:
+      description: |
+        `ACTION_ALREADY_CLAIMED` — the token was already consumed (a replay), or
+        `IDEMPOTENCY_KEY_REUSED` — the same key arrived with a different body,
+        which is a client bug or an attack, never a legitimate retry.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    UnsupportedMediaType:
+      description: '`Content-Type` is not `application/json`.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    UnknownActionType:
+      description: |
+        The action type is not in the server-side catalogue. Rejected rather
+        than defaulted to zero points — a silent success here would hide a
+        client bug and a probing attacker equally well.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    ActionTooFast:
+      description: |
+        Completion was reported sooner than the action can physically be
+        performed. Raises a security alert.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    RateLimited:
+      description: |
+        `RATE_LIMITED` — the request budget for the window is exhausted, or
+        `VELOCITY_EXCEEDED` — the hourly *points* budget is exhausted.
+
+        The two are different controls with different purposes: the first
+        protects the service from load, the second protects the scoreboard from
+        abuse. A user can stay inside the first and still accumulate an
+        impossible score, which is why both exist.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    WriteUnavailable:
+      description: |
+        A dependency required for a *safe* write is unavailable, so the write
+        was not accepted and nothing was persisted.
+
+        This is returned when PostgreSQL is unreachable, and also when Redis is
+        unreachable and the velocity budget therefore cannot be enforced. The
+        request rate limiter fails open in that situation; the velocity budget
+        deliberately does not — see ADR-011. Availability outranks a degraded
+        protective control for ordinary traffic, but it does not outrank the
+        integrity of the scoreboard itself.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
