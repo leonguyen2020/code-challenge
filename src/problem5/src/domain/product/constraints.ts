@@ -55,11 +55,38 @@ export const LIST_LIMIT_MIN = 1;
 export const LIST_LIMIT_MAX = 100;
 export const LIST_LIMIT_DEFAULT = 20;
 
+/**
+ * Upper bound on an inbound pagination cursor.
+ *
+ * A cursor this service issues is base64url of `{f, d, v, i}`, where the
+ * largest `v` is a product name of {@link NAME_MAX_LENGTH} characters - about
+ * 340 bytes encoded. 512 leaves generous headroom and still refuses a caller
+ * who sends a megabyte of base64 for the server to decode and JSON-parse.
+ *
+ * Every other string in the query is bounded; this one being unbounded was an
+ * omission rather than a decision.
+ */
+export const CURSOR_MAX_LENGTH = 512;
+
 /** Fields the list endpoint may be sorted by. Anything else is rejected. */
 export const SORTABLE_FIELDS = ['createdAt', 'priceMinor', 'name'] as const;
 export type SortableField = (typeof SORTABLE_FIELDS)[number];
 export type SortDirection = 'asc' | 'desc';
 
-/** Free-text search term bounds. Caps the work a single query can request. */
-export const SEARCH_TERM_MIN_LENGTH = 2;
+/**
+ * Free-text search term bounds. Caps the work a single query can request.
+ *
+ * The minimum is **3, not 2, and that is a performance decision rather than a
+ * usability one.** `q` is matched with `ILIKE '%term%'`, which a B-tree cannot
+ * serve because of the leading wildcard - the GIN trigram indexes
+ * (`IDX_products_name_trgm`, `IDX_products_sku_trgm`) exist for exactly that.
+ * But a trigram is three characters: PostgreSQL can extract none at all from a
+ * two-character pattern wrapped in wildcards, so `?q=ab` silently degenerates
+ * to a sequential scan of the whole table - the very thing the indexes were
+ * added to prevent, and the cheapest way for a caller to make the database do
+ * the most work.
+ *
+ * Three characters is the shortest term the index can actually accelerate.
+ */
+export const SEARCH_TERM_MIN_LENGTH = 3;
 export const SEARCH_TERM_MAX_LENGTH = 100;

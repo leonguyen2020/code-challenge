@@ -9,8 +9,8 @@ why a decision was made rather than how to implement it,
 [`DECISIONS.md`](DECISIONS.md) has the argument.
 
 **How to use it.** Read §1 and §2 once. Then, before writing the code for a
-ticket, read the matching entry in §3 — those seven entries are where the real
-mistakes happen, and five of the seven fail *silently*, which means tests that
+ticket, read the matching entry in §3 — those eight entries are where the real
+mistakes happen, and five of the eight fail *silently*, which means tests that
 pass and a bug found weeks later in production.
 
 The code below is **reference, not delivery**. It shows the shape and the
@@ -18,7 +18,7 @@ hazards; the team writes the real thing, with the tests.
 
 **Contents:** [Getting started](#1-getting-started) ·
 [The contracts](#2-the-contracts) ·
-[Seven ways to get this wrong](#3-seven-ways-to-get-this-wrong) ·
+[Eight ways to get this wrong](#3-eight-ways-to-get-this-wrong) ·
 [Tickets](#4-tickets) · [Tests that matter](#5-tests-that-matter) ·
 [Before you open a PR](#6-before-you-open-a-pr)
 
@@ -38,7 +38,7 @@ stack, already wired, and most of its infrastructure is directly reusable:
 | `src/shared/logger.ts` | Structured logging with credential redaction |
 | `src/interfaces/http/middleware/errorHandler.ts` | RFC 9457 responses; internal detail logged, never returned |
 | `src/interfaces/http/middleware/requestContext.ts` | `X-Request-Id` validation and correlation |
-| `src/interfaces/http/middleware/rateLimit.ts` | The Lua fixed-window limiter — extend it to a token bucket per §8.4 |
+| `src/interfaces/http/middleware/rateLimit.ts` | The Lua fixed-window limiter. **Replace the script** with the token bucket in [§8.4](../README.md#84-rate-limiting-and-the-separate-velocity-budget) — the surrounding middleware, the fail-open behaviour and the `RateLimit-*` headers all carry over unchanged |
 | `src/app.ts` | Middleware ordering, `helmet`, CORS, the "no `listen` here" pattern |
 | `jest.config.js`, `tsconfig.json` | Test projects (unit vs integration), strict compiler settings |
 
@@ -103,6 +103,9 @@ export interface ActionCatalogue {
 export interface RecordAwardCommand {
   readonly eventId: string;
   readonly userId: string;
+  /** Denormalised from the token/identity service; refreshes the copy in
+   *  user_scores and rides the outbox row. Spec §6.7. */
+  readonly displayName: string;
   readonly actionType: string;
   readonly points: number;
   readonly idempotencyKey: string;
@@ -113,13 +116,28 @@ export interface RecordAwardCommand {
 }
 
 export interface AwardResult {
-  /** bigint, not number: totals outlive Number.MAX_SAFE_INTEGER assumptions. */
+  /**
+   * bigint because the column is BIGINT and the API advertises int64 - the
+   * *storage* range is 64-bit and the ledger will happily hold it.
+   *
+   * That is NOT the same as the rankable range. The packed ZSET score caps
+   * points at 8,388,607 (spec §6.4), and `packScore` throws above it rather
+   * than wrapping. So a total is storable long before it is rankable, and the
+   * 80%-of-cap alert exists to make sure the gap is never reached in
+   * production. Do not read this type as permission to exceed the cap.
+   */
   readonly totalScore: bigint;
   readonly reachedAt: Date;
   readonly version: number;
   readonly isVisible: boolean;
   /** 'replayed' means the idempotency key was already used. Award once. */
   readonly outcome: 'awarded' | 'replayed';
+  /**
+   * The stored `202` body. On a replay this is read from
+   * score_events.response_snapshot (spec §6.6) and returned verbatim with 200
+   * - never recomputed, or two identical requests return different numbers.
+   */
+  readonly responseSnapshot: Readonly<Record<string, unknown>>;
 }
 
 export interface ScoreLedger {
@@ -129,7 +147,7 @@ export interface ScoreLedger {
 
 // ─── domain/scoreboard/ScoreboardReadModel.ts ───────────────────────────────
 // The read side. Split from the write side so the board can be served from
-// PostgreSQL when Redis is down (spec §9, F2) without a branch in every caller.
+// PostgreSQL when Redis is down (spec §9.2) without a branch in every caller.
 
 export interface ScoreboardEntry {
   readonly rank: number;
@@ -155,6 +173,8 @@ export interface ScoreboardReadModel {
 export interface OutboxRow {
   readonly seq: bigint;
   readonly userId: string;
+  /** Carried on the row so the projector can render an entry from it alone. */
+  readonly displayName: string;
   readonly totalScore: bigint;
   readonly reachedAt: Date;
   readonly isVisible: boolean;
@@ -164,6 +184,13 @@ export interface Outbox {
   /** FOR UPDATE SKIP LOCKED - several workers can claim different batches. */
   claim(batchSize: number): Promise<readonly OutboxRow[]>;
   markProcessed(seqs: readonly bigint[]): Promise<void>;
+  /**
+   * Move a row that cannot be applied out of the queue after 3 attempts.
+   * Spec §9.3 F13: a poison row in a strictly-ordered queue stalls every user
+   * behind it, so it must leave the queue and alert - never be retried
+   * forever, and never be skipped silently.
+   */
+  deadLetter(row: OutboxRow, attempts: number, error: string): Promise<void>;
   /** now() - oldest unprocessed created_at. The module's key metric (§11). */
   lagSeconds(): Promise<number>;
 }
@@ -178,9 +205,11 @@ not fit.
 
 ---
 
-## 3. Seven ways to get this wrong
+## 3. Eight ways to get this wrong
 
-Five of these fail silently. That is why they are listed.
+Five of these fail silently, and one (§3.8) fails so loudly and so
+immediately that it is usually mistaken for a driver bug. That is why they are
+listed.
 
 ### 3.1 Taking the user id from the request
 
@@ -467,6 +496,70 @@ The property test worth writing: for random `(points, time)` pairs, sorting by
 composite must equal sorting by `(points DESC, time ASC)`. That single test
 catches every encoding mistake at once.
 
+### 3.8 Catching `23505` inside an open transaction
+
+**The bug.** The obvious reading of spec [§6.2](../README.md#62-the-write-transaction),
+and it fails on the very first idempotent retry:
+
+```ts
+await tx.query('BEGIN');                                     // ✗
+try {
+  await tx.query('INSERT INTO score_events ...');
+} catch (e) {
+  if (isUniqueViolation(e, 'uq_score_events_idempotency')) {
+    // Looks fine. It is not - the transaction is already dead.
+    const prior = await tx.query('SELECT response_snapshot ...');
+    //            ^ throws 25P02: current transaction is aborted
+  }
+}
+```
+
+PostgreSQL is not MySQL here. **Any** statement error inside an open transaction
+aborts the whole transaction; every subsequent command returns
+`25P02 current transaction is aborted, commands ignored until end of
+transaction block` until a `ROLLBACK`. Catching the `23505` in application code
+does nothing to revive it — the connection is in a failed transaction, and the
+`SELECT` in the catch block fails too.
+
+This is worth its own entry because it is the one failure in this list that
+looks like a driver bug. The error is `25P02`, not the `23505` you were
+handling, and it surfaces from a line that has nothing wrong with it.
+
+**The fix.** A savepoint gives you something to roll back *to*:
+
+```ts
+await tx.query('BEGIN');
+await tx.query('SAVEPOINT sp_event');                        // ✓
+try {
+  await tx.query('INSERT INTO score_events ...');
+  await tx.query('RELEASE SAVEPOINT sp_event');
+} catch (e) {
+  await tx.query('ROLLBACK TO SAVEPOINT sp_event');          // ✓ transaction lives
+  if (isUniqueViolation(e, 'uq_score_events_idempotency')) {
+    const prior = await tx.query('SELECT response_snapshot ...');
+    await tx.query('COMMIT');
+    return { outcome: 'replayed', responseSnapshot: prior.rows[0].response_snapshot };
+  }
+  if (isUniqueViolation(e, 'uq_score_events_jti')) {
+    await tx.query('ROLLBACK');
+    throw new ActionAlreadyClaimedError();
+  }
+  await tx.query('ROLLBACK');
+  throw e;
+}
+```
+
+**Branch on the constraint *name*, never the message.** `error.constraint` is
+schema API and is stable; the message text is prose and changes between
+PostgreSQL versions and locales. The two unique violations on this table mean
+completely different things — one is a normal retry that returns `200`, the
+other is a replay attack that returns `409` and raises an alert — so telling
+them apart is not optional.
+
+The test that catches this: send the same `Idempotency-Key` twice
+*sequentially*, not concurrently. The concurrent test in §5 passes even with
+this bug, because both requests reach the `INSERT` before either fails.
+
 ---
 
 ## 4. Tickets
@@ -498,6 +591,8 @@ breakdown. Each ticket is meant to be one PR.
 | 2.5 | Rebuild command | Rebuilt board is byte-identical to the PostgreSQL ordering |
 | 2.6 | `GET /scoreboard/me` | Rank and neighbours correct |
 | 2.7 | Point `GET /top` at Redis, with PostgreSQL fallback | Board still served with Redis stopped |
+| 2.8 | Display-name projection: consume the identity service's profile-change event as a zero-point outbox row | A rename reaches the board without an award; no ledger row is written ([§6.7](../README.md#67-display-names-and-who-keeps-them-current)) |
+| 2.9 | Dead-letter path for unprojectable rows | A poison row leaves the queue after 3 attempts, alerts, and does not stall the users behind it ([§9.3 F13](../README.md#93-the-failure-matrix)) |
 
 ### Phase 3 — live
 
@@ -515,7 +610,7 @@ breakdown. Each ticket is meant to be one PR.
 |---|--------|-----------|
 | 4.1 | Action-token sign/verify + `POST /actions/start` | Forged, expired and foreign tokens all rejected |
 | 4.2 | Single-use consumption + minimum duration | Replay is `409`; too-fast is `422` |
-| 4.3 | Token-bucket rate limit, keyed per user | Limit holds across replicas |
+| 4.3 | Token-bucket rate limit, keyed per user ([§8.4](../README.md#84-rate-limiting-and-the-separate-velocity-budget)) | Limit holds across replicas; no 2× burst across a window boundary |
 | 4.4 | Velocity budget, failing closed | Exhausted budget is `429` with no ledger row |
 | 4.5 | Anomaly signals + review queue | Flags recorded; nothing auto-banned |
 | 4.6 | Reconciliation job | Injected drift is detected and alerted |
@@ -555,6 +650,13 @@ the fix and confirm the test goes red.
 award, 50 identical response bodies. Same action token from 20 connections: one
 `202`, nineteen `409`.
 
+Run the *sequential* case too, and do not treat it as the trivial one: send the
+key, wait for the response, send it again. That is the only test that catches
+§3.8 — the concurrent version passes with the savepoint bug still in, because
+every request reaches the `INSERT` before any of them fails. Then delete the
+Redis `idem:` key and send it a third time: the reply must still be the stored
+snapshot from PostgreSQL (§6.6), not a recomputed total.
+
 **Projector convergence.** Drive `project.lua` directly with shuffled,
 duplicated and out-of-order sequences and assert the final ZSET state matches
 the PostgreSQL ordering. No HTTP involved.
@@ -577,6 +679,9 @@ expects.
 - [ ] No `userId` or `points` read from a request body, query or header.
 - [ ] No read-modify-write on a total anywhere.
 - [ ] Every Redis read-then-write that makes a decision is one Lua script.
+- [ ] Every `catch` around a constraint violation inside a transaction has a
+      `SAVEPOINT` to roll back to, and branches on `error.constraint`, not on
+      the message text (§3.8).
 - [ ] JWT verification passes an explicit `algorithms` whitelist.
 - [ ] Every new failure has an `AppError` subclass with a stable `code`, and
       appears in [§5.6](../README.md#56-errors) and `openapi.yaml`.

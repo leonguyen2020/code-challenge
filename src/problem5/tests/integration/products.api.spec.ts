@@ -183,10 +183,12 @@ describe('GET /api/v1/products (list, filters, pagination)', () => {
   });
 
   it('treats LIKE metacharacters in the search term as literals', async () => {
-    // Unescaped, `%%` matches every row - a wrong answer and the cheapest way
-    // to make the database do the most work.
-    expect((await api().get(`${BASE}?q=%25%25`).expect(200)).body.items).toHaveLength(0);
-    expect((await api().get(`${BASE}?q=__`).expect(200)).body.items).toHaveLength(0);
+    // Unescaped, `%%%` matches every row - a wrong answer and the cheapest way
+    // to make the database do the most work. Three characters because that is
+    // the minimum term length (SEARCH_TERM_MIN_LENGTH), which is itself set by
+    // what a trigram index can serve.
+    expect((await api().get(`${BASE}?q=%25%25%25`).expect(200)).body.items).toHaveLength(0);
+    expect((await api().get(`${BASE}?q=___`).expect(200)).body.items).toHaveLength(0);
   });
 
   it('rejects a sort field that is not whitelisted', async () => {
@@ -205,6 +207,11 @@ describe('GET /api/v1/products (list, filters, pagination)', () => {
     ['non-numeric limit', 'limit=abc'],
     ['empty numeric filter', 'minPrice='],
     ['inverted price range', 'minPrice=100&maxPrice=50'],
+    // Regression: these used to reach PostgreSQL as bigint literals that
+    // overflowed the column, so the driver error surfaced as a 500.
+    ['price bound beyond bigint', 'minPrice=9223372036854775808'],
+    ['price bound beyond the safe range', 'maxPrice=99999999999999999999'],
+    ['price bound above the column ceiling', 'minPrice=1000000000001'],
     ['search term too short', 'q=a'],
     ['malformed cursor', 'cursor=not-base64'],
   ])('rejects %s with 400', async (_label, query) => {

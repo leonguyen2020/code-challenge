@@ -42,7 +42,7 @@ curl localhost:3000/readyz
 |---------|--------------|---------------|
 | `npm run dev` | Development server with reload | yes |
 | `npm run build` / `npm start` | Compile to `dist/`, then run the compiled output | yes, to run |
-| `npm test` | **Everything** — 216 tests, ~3 s | yes |
+| `npm test` | **Everything** — 224 tests, ~6 s | yes |
 | `npm run test:coverage` | Everything, with the coverage report (gate: 100%) | yes |
 | `npm run test:unit` | Unit tests only — no database, ~2 s | **no** |
 | `npm run test:integration` | Integration tests only | yes |
@@ -153,7 +153,7 @@ curl 'localhost:3000/api/v1/products?category=beverage&minPrice=10000&maxPrice=5
 | `currency` | `VND` \| `USD` \| `EUR` \| `JPY` |
 | `minPrice`, `maxPrice` | Integer minor units |
 | `inStock`, `isActive` | `true` \| `false` \| `1` \| `0` |
-| `q` | Free text over name and SKU, 2–100 characters |
+| `q` | Free text over name and SKU, 3–100 characters (three is the shortest term a trigram index can serve) |
 | `sort` | `createdAt` \| `priceMinor` \| `name`, optionally `:asc` / `:desc` |
 | `limit` | 1–100, default 20 |
 | `cursor` | From the previous page's `nextCursor` |
@@ -344,14 +344,14 @@ or permissions, and Problem 6 is where the authorisation design belongs.
 
 ## Testing
 
-**216 tests — 140 unit, 76 integration — 100% statements, branches, functions
+**224 tests — 145 unit, 79 integration — 100% statements, branches, functions
 and lines.**
 
 ```
-Statements   : 100% ( 427/427 )
-Branches     : 100% ( 149/149 )
-Functions    : 100% ( 81/81 )
-Lines        : 100% ( 419/419 )
+Statements   : 100% ( 433/433 )
+Branches     : 100% ( 151/151 )
+Functions    : 100% ( 83/83 )
+Lines        : 100% ( 425/425 )
 ```
 
 Coverage is measured over the **whole** suite. A unit-only run reports far less

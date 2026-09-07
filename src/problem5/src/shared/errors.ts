@@ -28,7 +28,11 @@ export type ErrorCode =
 export interface FieldIssue {
   /** Dotted path to the offending field, e.g. `"price.amount"`. */
   readonly path: string;
-  /** Human-readable explanation. Never contains the submitted value verbatim. */
+  /**
+   * Human-readable explanation. Never contains the submitted value verbatim -
+   * enforced by `safeIssueMessage` in the error handler, because zod's own
+   * default text for a failed enum echoes the input back.
+   */
   readonly message: string;
 }
 

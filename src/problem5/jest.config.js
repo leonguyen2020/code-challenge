@@ -3,12 +3,18 @@
  *
  * Unit tests use an in-memory repository and touch nothing external, so they
  * run in seconds and can be run on every save. Integration tests need Postgres
- * and Redis and run against a dedicated database. Mixing them in one command
- * means the fast feedback loop is only as fast as the slow half.
+ * and Redis and run against a dedicated database. Splitting them into projects
+ * is what lets the fast feedback loop stay fast without giving up the slow
+ * half.
  *
- *   npm test              unit only
- *   npm run test:integration
- *   npm run test:all
+ *   npm test                  both projects - the full suite
+ *   npm run test:unit         unit only; needs nothing external
+ *   npm run test:integration  integration only; needs Postgres + Redis
+ *   npm run test:coverage     the full suite, with the 100% gate
+ *
+ * Coverage is measured over the *whole* suite: the repository and the
+ * controller are exercised by the integration tests, so a unit-only run
+ * reports far less and would fail the gate.
  *
  * @type {import('jest').Config}
  */
@@ -75,11 +81,16 @@ module.exports = {
   // reachable decision - a status code, a concurrency outcome, a validation
   // rule - so an uncovered one means an untested edge case.
   //
-  // One file carries `istanbul ignore file`: ProductOrmEntity.ts. It declares a
-  // schema and contains no logic; its only branches are emitted by TypeScript
-  // for `emitDecoratorMetadata` and are unreachable by construction. The
-  // mapping it declares is verified end to end by the integration suite. That
-  // exclusion is stated here so "100%" is not read as more than it is.
+  // Nothing is suppressed with an `istanbul ignore file` to reach that number.
+  // The only branches that were ever unreachable were compiler output rather
+  // than code: `emitDecoratorMetadata` compiles a Date-typed property to
+  // `typeof Date !== "undefined" ? Date : Object`, whose fallback can never
+  // execute. Rather than hide them behind an ignore comment, the flag itself
+  // is off (see tsconfig.json) - every column here declares its `type`
+  // explicitly anyway, which is the better practice regardless.
+  //
+  // The files excluded above are excluded by path, listed in the open, and are
+  // process entry points and developer scripts rather than shipped logic.
   coverageThreshold: {
     global: { branches: 100, functions: 100, lines: 100, statements: 100 },
   },

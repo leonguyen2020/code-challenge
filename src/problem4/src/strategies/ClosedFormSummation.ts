@@ -33,8 +33,9 @@ import type { ComplexityProfile, SummationStrategy } from '../domain/types';
  * binade below the danger zone, so it does not depend on that invariant at all.
  * When correctness costs one comparison, buy it.
  *
- * `tests/closedForm.spec.ts` pins both facts so a future edit cannot quietly
- * invalidate this reasoning.
+ * `tests/strategies.spec.ts` and `tests/differential.spec.ts` pin both facts -
+ * the halved form's exactness and the naive form's - against a `BigInt` oracle,
+ * so a future edit cannot quietly invalidate this reasoning.
  */
 export class ClosedFormSummation implements SummationStrategy {
   public readonly name = 'closed-form';

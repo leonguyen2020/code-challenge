@@ -98,6 +98,27 @@ describe('errorHandler', () => {
     expect((state.body as { issues: unknown[] }).issues.length).toBeGreaterThan(0);
   });
 
+  it('never echoes the submitted value back in a validation message', () => {
+    const { res, state } = fakeResponse();
+    const secret = 'SENSITIVE_VALUE_FROM_THE_CLIENT';
+    const parsed = z
+      .object({ category: z.enum(['beverage', 'snack']) })
+      .safeParse({ category: secret });
+    handle(
+      (parsed as { error: ZodError }).error,
+      fakeRequest(),
+      res,
+      jest.fn() as NextFunction,
+    );
+
+    const issues = (state.body as { issues: { path: string; message: string }[] }).issues;
+    // zod's own text is "... received 'SENSITIVE_VALUE_FROM_THE_CLIENT'".
+    expect(JSON.stringify(issues)).not.toContain(secret);
+    // ...but the caller still learns what the field will accept.
+    expect(issues[0]?.message).toBe('must be one of: beverage, snack');
+    expect(issues[0]?.path).toBe('category');
+  });
+
   it.each([
     ['entity.parse.failed', 400, 'MALFORMED_JSON'],
     ['entity.too.large', 413, 'PAYLOAD_TOO_LARGE'],

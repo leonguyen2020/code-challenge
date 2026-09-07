@@ -282,17 +282,20 @@ sequenceDiagram
         API->>API: 1 verify JWT signature, exp, aud, iss
         API->>API: 2 schema validation (no userId, no points accepted)
         API->>RD: 3 per-user rate limit (token bucket, Lua)
-        API->>API: 4 verify actionToken HMAC, TTL, binding
-        API->>API: 5 elapsed >= minDurationMs for this action type?
-        API->>RD: 6 consume jti - DEL returns 1 exactly once
-        API->>RD: 7 velocity budget - points this hour within cap?
-        API->>API: 8 points := ActionCatalogue.lookup(actionType)
+        API->>RD: 4 idempotency lookup - replay stored response if seen
+        API->>API: 5 verify actionToken HMAC, TTL, binding
+        API->>API: 6 elapsed >= minDurationMs for this action type?
+        API->>RD: 7 consume jti - DEL returns 1 exactly once
+        API->>RD: 8 velocity budget - points this hour within cap?
+        API->>API: 9 points := ActionCatalogue.lookup(actionType)
     end
 
     rect rgb(240, 244, 248)
         Note over API,PG: Phase 4 - one transaction, or nothing
         API->>PG: BEGIN
+        API->>PG: SAVEPOINT sp_event
         API->>PG: INSERT score_events (idempotency_key UNIQUE)
+        Note right of PG: 23505 here aborts the transaction.<br/>ROLLBACK TO SAVEPOINT first - see §6.2
         API->>PG: UPDATE user_scores SET total = total + points<br/>RETURNING total, version
         API->>PG: INSERT outbox (user_id, total, occurred_at)
         API->>PG: COMMIT
@@ -634,6 +637,11 @@ CREATE TABLE score_events (
     catalogue_version INTEGER     NOT NULL,
     request_id        UUID        NOT NULL,
     client_ip_hash    BYTEA,          -- hashed, not stored raw: see §8.9
+    -- The response body this award produced, stored so that an idempotent
+    -- replay returns the SAME numbers the original did rather than recomputing
+    -- them. It lives here, not only in Redis, because the Redis copy expires
+    -- after 24 h while the unique constraint below is permanent - see §6.6.
+    response_snapshot JSONB       NOT NULL,
     occurred_at       TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
 
     CONSTRAINT uq_score_events_idempotency UNIQUE (user_id, idempotency_key),
@@ -646,6 +654,11 @@ CREATE INDEX ix_score_events_time      ON score_events (occurred_at DESC);
 -- The materialised total. Derivable from the ledger, kept for read speed.
 CREATE TABLE user_scores (
     user_id      UUID        PRIMARY KEY REFERENCES users(id),
+    -- Denormalised from the identity service. The board renders a name for
+    -- every entry, and the projector must be able to produce a complete
+    -- snapshot without a synchronous call to another service on the write
+    -- path. Kept current by §6.7.
+    display_name TEXT        NOT NULL CHECK (length(display_name) BETWEEN 1 AND 64),
     total_score  BIGINT      NOT NULL DEFAULT 0 CHECK (total_score >= 0),
     reached_at   TIMESTAMPTZ(3) NOT NULL DEFAULT now(),  -- when this total was reached
     version      INTEGER     NOT NULL DEFAULT 0,
@@ -661,6 +674,11 @@ CREATE INDEX ix_user_scores_board
 CREATE TABLE scoreboard_outbox (
     seq          BIGSERIAL   PRIMARY KEY,
     user_id      UUID        NOT NULL,
+    -- Carried on the row so the projector has everything it needs to render a
+    -- board entry from the outbox alone. A projector that had to look names up
+    -- elsewhere would couple rebuilding the read model to a second store being
+    -- available.
+    display_name TEXT        NOT NULL,
     total_score  BIGINT      NOT NULL,
     reached_at   TIMESTAMPTZ(3) NOT NULL,
     is_visible   BOOLEAN     NOT NULL,
@@ -671,6 +689,23 @@ CREATE TABLE scoreboard_outbox (
 CREATE INDEX ix_outbox_unprocessed
     ON scoreboard_outbox (seq)
     WHERE processed_at IS NULL;
+
+-- Rows the projector could not apply. Separate table rather than a flag, so
+-- the partial index above stays small and the claim query never walks them.
+-- See §9.3 F13: a poison row in a strictly-ordered queue stalls every user
+-- behind it, so it must leave the queue and raise an alert, not be retried
+-- forever or dropped in silence.
+CREATE TABLE scoreboard_outbox_dead (
+    seq          BIGINT      PRIMARY KEY,
+    user_id      UUID        NOT NULL,
+    display_name TEXT        NOT NULL,
+    total_score  BIGINT      NOT NULL,
+    reached_at   TIMESTAMPTZ(3) NOT NULL,
+    is_visible   BOOLEAN     NOT NULL,
+    attempts     INTEGER     NOT NULL,
+    last_error   TEXT        NOT NULL,
+    dead_at      TIMESTAMPTZ(3) NOT NULL DEFAULT now()
+);
 ```
 
 **Why both a ledger and a total.** The ledger is the truth and makes every score
@@ -711,27 +746,52 @@ Normative. All four statements, one transaction, or none.
 ```sql
 BEGIN;
 
+-- The SAVEPOINT is not optional, and the reason is the single most likely
+-- implementation mistake in this module. In PostgreSQL any statement error
+-- inside an open transaction puts the whole transaction into the aborted
+-- state: every subsequent command then fails with 25P02
+-- ("current transaction is aborted") until a ROLLBACK. So the unique-violation
+-- branches below CANNOT simply be caught and continued from - without a
+-- savepoint to roll back to, the handler that "catches 23505 and replays"
+-- fails on its very next statement.
+SAVEPOINT sp_event;
+
 INSERT INTO score_events (id, user_id, action_type, points, idempotency_key,
                           action_token_jti, catalogue_version, request_id,
-                          client_ip_hash, occurred_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now());
--- 23505 on uq_score_events_idempotency → replay the stored response (200)
--- 23505 on uq_score_events_jti         → 409 ACTION_ALREADY_CLAIMED
+                          client_ip_hash, response_snapshot, occurred_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now());
+-- On 23505, first:  ROLLBACK TO SAVEPOINT sp_event;  then branch on the
+-- constraint name carried by the driver error:
+--   uq_score_events_idempotency → SELECT response_snapshot for (user_id,
+--                                 idempotency_key), COMMIT, return it with 200
+--                                 and Idempotency-Replayed: true   (§6.6)
+--   uq_score_events_jti         → ROLLBACK, 409 ACTION_ALREADY_CLAIMED
+-- Branch on the constraint name, never on the message text: the name is
+-- schema API, the message is not.
+RELEASE SAVEPOINT sp_event;
 
-INSERT INTO user_scores (user_id, total_score, reached_at, version)
-VALUES ($2, $4, now(), 1)
+INSERT INTO user_scores (user_id, display_name, total_score, reached_at, version)
+VALUES ($2, $11, $4, now(), 1)
 ON CONFLICT (user_id) DO UPDATE
    SET total_score = user_scores.total_score + EXCLUDED.total_score,
        reached_at  = now(),
        version     = user_scores.version + 1,
        updated_at  = now()
-RETURNING total_score, reached_at, version, is_visible;
+RETURNING total_score, reached_at, version, is_visible, display_name;
 
-INSERT INTO scoreboard_outbox (user_id, total_score, reached_at, is_visible)
-VALUES ($2, <returned total>, <returned reached_at>, <returned is_visible>);
+INSERT INTO scoreboard_outbox (user_id, display_name, total_score, reached_at, is_visible)
+VALUES ($2, <returned display_name>, <returned total>, <returned reached_at>,
+        <returned is_visible>);
 
 COMMIT;
 ```
+
+**Why a savepoint rather than catching the error outside the transaction.**
+Retrying the whole transaction after a rollback would work, but it costs a
+second round trip on the *expected* path — idempotent retries from mobile
+clients are normal traffic, not an exception. The savepoint keeps the replay to
+one transaction, and it is the only construct that lets a caught constraint
+violation be recovered from in place.
 
 **The total is incremented in the database, not read-modify-written in the
 application.** `SET total = total + $n` is a single atomic statement; the row
@@ -761,10 +821,10 @@ scores.
 | `scoreboard:snapshot` | STRING | pre-rendered top-10 JSON, served verbatim | none |
 | `scoreboard:version` | STRING | monotonic counter, `INCR` per publish | none |
 | `scoreboard:seq:{userId}` | STRING | last outbox `seq` applied for this user | 7 d |
-| `scoreboard:names` | HASH | `userId` → display name | none |
+| `scoreboard:names` | HASH | `userId` → display name, written by `project.lua` (§6.7) | none |
 | `action:{jti}` | STRING | pending action token marker | 300 s |
-| `idem:{userId}:{key}` | STRING | stored response for replay | 24 h |
-| `ratelimit:{userId}:{window}` | STRING | request counter | window |
+| `idem:{userId}:{key}` | STRING | cached response for replay; the authority is PostgreSQL (§6.6) | 24 h |
+| `ratelimit:{userId}` | HASH | token bucket: `{ tokens, refilledAtMs }` (§8.4) | 2 × refill period |
 | `velocity:{userId}:{hour}` | STRING | points awarded this hour | 2 h |
 | `scoreboard:events` | channel | pub/sub fan-out of the snapshot | — |
 
@@ -825,8 +885,10 @@ overlap briefly during a failover. The fix is a per-user sequence guard,
 evaluated atomically inside Redis.
 
 ```lua
--- project.lua — KEYS[1] = scoreboard:global, KEYS[2] = scoreboard:seq:{userId}
--- ARGV = { userId, seq, composite, isVisible }
+-- project.lua
+--   KEYS[1] = scoreboard:global      KEYS[2] = scoreboard:seq:{userId}
+--   KEYS[3] = scoreboard:names
+--   ARGV    = { userId, seq, composite, isVisible, displayName }
 local lastSeq = tonumber(redis.call('GET', KEYS[2])) or 0
 local seq = tonumber(ARGV[2])
 
@@ -836,8 +898,13 @@ end
 
 if ARGV[4] == '1' then
   redis.call('ZADD', KEYS[1], tonumber(ARGV[3]), ARGV[1])
+  -- The name is written in the same atomic step as the score. Writing it
+  -- separately would let a broadcast observe a member that is in the ZSET but
+  -- absent from the name hash, and render a board row with no name.
+  redis.call('HSET', KEYS[3], ARGV[1], ARGV[5])
 else
   redis.call('ZREM', KEYS[1], ARGV[1])   -- opted out: not on the public board
+  redis.call('HDEL', KEYS[3], ARGV[1])   -- and no residual name left behind
 end
 
 redis.call('SET', KEYS[2], ARGV[2], 'EX', 604800)
@@ -856,6 +923,76 @@ workers can share the backlog without blocking each other or double-processing.
 Processed rows are deleted by a nightly job with a 7-day retention window —
 long enough to replay a projection incident, short enough that the table does
 not become the largest thing in the database.
+
+### 6.6 The idempotency record, and why it outlives the cache
+
+`Idempotency-Key` is enforced in two places with **different lifetimes**, and
+the mismatch is a trap worth spelling out because it only appears a day after
+the code ships.
+
+| Layer | Key | Lifetime | Role |
+|---|---|---|---|
+| Redis | `idem:{userId}:{key}` | 24 h | Fast path — returns the stored response with no database round trip |
+| PostgreSQL | `uq_score_events_idempotency` | For the life of the ledger row | The authority |
+
+The constraint outlives the cache entry. At 24 hours plus one second a repeated
+key still raises `23505`, but the Redis copy of the response is gone. If the
+handler responded by *recomputing* the total at that point it would return a
+different number for the same logical operation — which is precisely the bug
+[ADR-008](docs/DECISIONS.md#adr-008-idempotency-key-is-required-not-optional)
+exists to prevent, reintroduced by an expiry nobody was thinking about.
+
+**So the response is stored on the ledger row itself**, in
+`score_events.response_snapshot`, and the replay path reads it from there
+whenever the cache misses:
+
+```sql
+SELECT response_snapshot
+FROM   score_events
+WHERE  user_id = $1 AND idempotency_key = $2;
+```
+
+Redis stays a pure cache: it can be flushed at any moment and idempotency still
+holds, which is the same "Redis is disposable" rule as
+[§3.2](#32-the-two-rules-that-hold-the-design-together). The stored snapshot is
+the `202` body verbatim; on replay it is returned with `200` and
+`Idempotency-Replayed: true`.
+
+`rank` and `boardVersion` inside a replayed snapshot are the values as at the
+original award and will be stale. That is correct rather than unfortunate: a
+replay is the *same* operation, and reporting a fresh rank would make two
+identical requests return different bodies. Both fields are already documented
+as best-effort in [§5.2](#52-post-score-increments).
+
+### 6.7 Display names, and who keeps them current
+
+The board renders a name for every entry, so a name must be reachable without a
+synchronous call to the identity service on either the write path or the read
+path. Three rules, in order:
+
+1. **`user_scores.display_name` is the module's copy**, denormalised from the
+   identity service. It is set on the first award and refreshed on every
+   subsequent one, so an active user's name is never more than one award stale.
+2. **Every outbox row carries the name**, so the projector can render a complete
+   board entry from the row alone, and so a rebuild from PostgreSQL
+   ([§9.4](#94-rebuild-and-reconciliation)) needs no other source.
+3. **`project.lua` writes the name into `scoreboard:names` in the same atomic
+   step as the ZSET update** (§6.5), so no broadcast can observe a member that
+   is ranked but unnamed.
+
+**Renames.** Rule 1 alone would leave a user who renames and never scores again
+displaying their old name indefinitely. The identity service therefore emits a
+profile-change event that the module consumes as a **zero-point projection**: it
+updates `user_scores.display_name` and writes an outbox row carrying the
+unchanged total. No ledger row is written — a rename is not an award — so the
+score is untouched while the board converges through the normal projector path.
+Consuming that event is ticket 2.8; until it exists, rule 1 is the fallback and
+the staleness is bounded by the user's next award.
+
+**Opt-out.** When `is_visible` flips to false the projector `ZREM`s the member
+*and* `HDEL`s the name, so nothing is left in Redis to leak through a code path
+that forgets the filter — the same reasoning as
+[§8.9](#89-privacy), applied to the name hash rather than only the ranking.
 
 ---
 
@@ -1065,6 +1202,47 @@ impossible score, because the limit was chosen to protect CPU rather than
 fairness. The velocity budget is a business rule and belongs in the domain, not
 in a middleware sizing exercise.
 
+**The request limiter is a token bucket, not the fixed window Problem 5 uses.**
+The mechanism is normative because the two are not interchangeable here. A fixed
+window lets a client spend its whole budget in the last instant of one window
+and the whole of the next in the first instant of the following one — a 2×
+burst across the boundary. On an endpoint whose entire purpose is to stop a
+user awarding themselves points faster than they should, a predictable 2×
+burst is the wrong shape. A bucket smooths that: capacity 60, refilling at one
+token per second, so a client may burst to 60 and then sustain 60/min, never
+120 in any 60-second span.
+
+State is `ratelimit:{userId}` — a HASH holding `{ tokens, refilledAtMs }` — and
+the refill-then-consume is one Lua script, for exactly the reason Problem 5's
+`INCR`/`EXPIRE` pair is one script: a read followed by a write is a race, and
+two concurrent requests would each refill from the same stale timestamp.
+
+```lua
+-- ratelimit.lua — KEYS[1] = ratelimit:{userId}
+-- ARGV = { capacity, refillPerSecond, nowMs, ttlSeconds }
+local state    = redis.call('HMGET', KEYS[1], 'tokens', 'refilledAtMs')
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now      = tonumber(ARGV[3])
+
+local tokens     = tonumber(state[1]) or capacity
+local refilledAt = tonumber(state[2]) or now
+
+tokens = math.min(capacity, tokens + ((now - refilledAt) / 1000) * rate)
+if tokens < 1 then
+  -- No token consumed. Report the wait in milliseconds so the caller can set
+  -- a truthful Retry-After rather than a guessed one.
+  return { 0, math.ceil(((1 - tokens) / rate) * 1000) }
+end
+
+redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilledAtMs', now)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+return { 1, 0 }
+```
+
+`nowMs` is passed in by the caller rather than read inside the script, so the
+script stays deterministic and replica-safe.
+
 **Keyed by user id, not by IP.** Mobile carriers put thousands of users behind
 one NAT address, and IPv6 gives a single attacker a /64. IP is retained as a
 secondary signal for anomaly detection, not as the limiter's identity.
@@ -1147,6 +1325,41 @@ a test asserts the secrets do not appear in the output, as in Problem 5.
 Each row is a state the module must survive without data loss and without a
 misleading response.
 
+### 9.1 PostgreSQL unavailable
+
+Writes are refused with `503 WRITE_UNAVAILABLE` and a `Retry-After`. Nothing is
+accepted, so nothing is lost. Reads continue to be served from the Redis read
+model, which means the board stays visible but frozen at its last projected
+state.
+
+Refusing writes is the only correct behaviour: PostgreSQL is the system of
+record ([§3.2](#32-the-two-rules-that-hold-the-design-together)), so an award
+that cannot be written there did not happen. Accepting it into Redis and
+"reconciling later" would invent a score with no ledger row behind it.
+
+### 9.2 Redis unavailable
+
+Writes are still accepted — PostgreSQL is the record and the outbox absorbs the
+projection backlog. The degradation is on the read side:
+
+- `GET /scoreboard/top` falls back to `ORDER BY total_score DESC, reached_at ASC
+  LIMIT 10` against PostgreSQL, cached 5 s in-process to bound the load. This is
+  a second implementation of `ScoreboardReadModel`, selected at construction —
+  not a branch inside every caller ([§3.3](#33-internal-structure)).
+- Streams close and clients fall back to polling `GET /top`.
+- The velocity budget **fails closed** while the request limiter fails open
+  ([§8.4](#84-rate-limiting-and-the-separate-velocity-budget),
+  [ADR-011](docs/DECISIONS.md#adr-011-rate-limiter-fails-open-velocity-budget-fails-closed)).
+
+Idempotency is unaffected, because the authority is the unique index rather
+than the cache ([§6.6](#66-the-idempotency-record-and-why-it-outlives-the-cache)).
+
+**§9.1 and §9.2 are deliberately asymmetric.** Losing the record store must stop
+writes; losing the cache must not. That asymmetry is the whole return on the
+"PostgreSQL is the only system of record" rule.
+
+### 9.3 The failure matrix
+
 | # | Failure | Behaviour | Consequence |
 |---|---------|-----------|-------------|
 | F1 | **PostgreSQL unavailable** | Writes → `503 WRITE_UNAVAILABLE` + `Retry-After`. Reads continue from Redis. | Degraded: board readable, frozen. No data loss — nothing was accepted. |
@@ -1158,13 +1371,20 @@ misleading response.
 | F7 | **Instance dies holding SSE connections** | Clients auto-reconnect to another instance and receive a fresh snapshot. | A few seconds of staleness for those clients. |
 | F8 | **Client retries after a timeout** | `Idempotency-Key` replays the stored response. | None — no double award. |
 | F9 | **Identity service / JWKS unavailable** | Cached keys keep verification working. If a `kid` is unknown and JWKS is unreachable → `503`, never "allow". | Degraded auth for new keys only. **Fails closed.** |
-| F10 | **Score exceeds the packed-score cap** | Alert fires at 80% (§6.4). | If ignored: silent rank corruption. Hence the alert is mandatory. |
+| F10 | **Score exceeds the packed-score cap** | Alert fires at 80% of the cap (§6.4). Beyond it, `packScore` **throws** rather than wrapping — the row becomes a poison pill and is handled as F13, never silently mis-ranked. | Writes and totals are unaffected; that user cannot be projected until the bits are re-split and the board rebuilt (§6.4). |
 | F11 | **Outbox grows unboundedly** | Alert on unprocessed depth; the partial index keeps the claim query fast regardless of table size. | Disk pressure only. |
 | F12 | **Clock skew between instances** | `reached_at` comes from PostgreSQL `now()`, not from application clocks. | None — one clock is authoritative. |
+| F13 | **An outbox row cannot be projected** (over-cap score, timestamp outside the epoch, malformed row) | The projector must not retry it forever and must not skip it silently. After 3 failed attempts the row is moved to `scoreboard_outbox_dead` with the error, marked processed, and `scoreboard_outbox_dead_total` is incremented — **any non-zero value alerts**. The batch continues. | One user's board position is stale until the row is repaired and replayed. Every other user is unaffected. |
 
-**F1 and F2 are deliberately asymmetric.** Losing the record store must stop
-writes; losing the cache must not. That asymmetry is the whole return on the
-"PostgreSQL is the only system of record" rule in §3.2.
+**F13 exists because failing loudly is only half a design.** `packScore`
+throwing is correct — [`IMPLEMENTATION_GUIDE.md` §3.7](docs/IMPLEMENTATION_GUIDE.md#37-the-packed-score-and-the-32-bit-trap)
+is right to refuse to wrap silently. But the throw happens inside the
+*projector*, not the request handler, and nobody is waiting on it. Without a
+dead-letter path the loop either crash-loops on the same row or skips it with no
+record, and in both cases projection stops for **every** user behind that row.
+A poison pill in a strictly-ordered queue is an outage, not a data-quality
+issue. The per-user sequence guard (§6.5) means a dead-lettered row can be
+replayed later without disturbing anything applied after it.
 
 ### 9.4 Rebuild and reconciliation
 
@@ -1294,6 +1514,7 @@ tell *why* it is not working at 3am.
 | `scoreboard_increment_duration_seconds` | histogram | p99 latency |
 | `scoreboard_projector_lag_seconds` | **gauge** | **> 5 s warn, > 30 s page** |
 | `scoreboard_outbox_unprocessed` | gauge | Sustained growth |
+| `scoreboard_outbox_dead_total{reason}` | counter | **Any non-zero value** — §9.3 F13 |
 | `scoreboard_broadcasts_total` | counter | Suppression ratio (should be high) |
 | `scoreboard_sse_connections` | gauge | Per instance, against the cap |
 | `scoreboard_sse_dropped_total{reason}` | counter | Backpressure disconnects |
@@ -1337,10 +1558,21 @@ reason — every branch here is a reachable decision about money-equivalent stat
       — the test that catches read-modify-write, run at N ≥ 100.
 - [ ] The same `Idempotency-Key` submitted 50 times concurrently awards points
       exactly once.
+- [ ] The same `Idempotency-Key` submitted **sequentially** replays the stored
+      response — the case that catches the aborted-transaction bug, which the
+      concurrent test above passes straight through
+      ([`IMPLEMENTATION_GUIDE.md` §3.8](docs/IMPLEMENTATION_GUIDE.md#38-catching-23505-inside-an-open-transaction)).
+- [ ] With the Redis `idem:` key deleted, a replay still returns the original
+      response from `score_events.response_snapshot` (§6.6) rather than a
+      recomputed total.
 - [ ] The same action token submitted concurrently from 20 connections yields
       one `202` and nineteen `409`.
 - [ ] Out-of-order and duplicated outbox rows converge to the correct ZSET
       state (drive `project.lua` directly with shuffled sequences).
+- [ ] A row that cannot be projected is dead-lettered after 3 attempts, alerts,
+      and does **not** stall the rows behind it (§9.3 F13).
+- [ ] A display-name change reaches the board without writing a ledger row, and
+      leaves the total untouched (§6.7).
 - [ ] Ties resolve to the earlier `reached_at`, verified against the PostgreSQL
       ordering.
 - [ ] Redis and PostgreSQL orderings agree over a randomised 10,000-user

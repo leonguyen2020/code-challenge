@@ -1,0 +1,142 @@
+# ---------------------------------------------------------------------------
+# CI for the 99Tech code challenge.
+#
+# Both packages hold a 100% coverage gate, a strict typecheck and - for
+# Problem 5 - a suite that runs against real PostgreSQL and Redis. A gate that
+# only runs when somebody remembers to run it is not a gate, so all of it runs
+# here on every push and pull request.
+#
+# Problem 5's job deliberately brings up the repository-root Docker Compose
+# stack rather than using GitHub's `services:` containers. Two reasons:
+#
+#   1. It is the *same* stack a developer runs locally, with the same
+#      hardening - scram-sha-256, Redis AUTH with dangerous commands removed,
+#      loopback-only publishing. `services:` would be a second, weaker
+#      definition of the environment that could drift from the real one.
+#   2. It lets `scripts/verify-infra.sh` run in CI, so the 31 infrastructure
+#      and security checks are enforced rather than documented.
+# ---------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run still in flight: the older
+# result is about to be irrelevant, and the runner minutes are not.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  problem4:
+    name: Problem 4 - sum to n
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/problem4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/problem4/package-lock.json
+
+      # `npm ci` installs exactly the lockfile. `npm install` would happily
+      # resolve a newer transitive version, so CI would stop testing what the
+      # Dockerfile ships.
+      - run: npm ci
+
+      - name: Typecheck (strict)
+        run: npm run typecheck
+
+      - name: 'Test with coverage (gate: 100%)'
+        run: npm run test:coverage
+
+      # The full-domain checks are opt-in locally because they are slow; CI is
+      # exactly where they should not be skipped.
+      - name: Heavy tests (full domain)
+        run: npm run test:heavy
+
+      - name: Audit production dependencies
+        run: npm audit --audit-level=high
+
+  # -------------------------------------------------------------------------
+  problem5:
+    name: Problem 5 - crude server
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/problem5/package-lock.json
+
+      # The compose stack requires credentials and has no defaults - it refuses
+      # to start rather than booting with a weak password. The committed
+      # template supplies throwaway local values, which is all CI needs.
+      - name: Configure infrastructure credentials
+        run: cp .env.example .env
+
+      - name: Start PostgreSQL and Redis
+        run: docker compose up -d --wait
+
+      - name: Verify infrastructure (31 functional and security checks)
+        run: ./scripts/verify-infra.sh
+
+      - run: npm ci
+        working-directory: src/problem5
+
+      - name: Typecheck (strict)
+        run: npm run typecheck
+        working-directory: src/problem5
+
+      - name: Run migrations
+        run: npm run migration:run
+        working-directory: src/problem5
+
+      # Reverting and re-applying proves the down path works. A migration that
+      # has never been rolled back is a one-way door nobody has tried to open.
+      - name: Verify the migration is reversible
+        run: npm run migration:revert && npm run migration:run
+        working-directory: src/problem5
+
+      - name: 'Test with coverage (gate: 100%)'
+        run: npm run test:coverage
+        working-directory: src/problem5
+
+      - name: Build
+        run: npm run build
+        working-directory: src/problem5
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+        working-directory: src/problem5
+
+      - name: Build the container image
+        run: docker build -t problem5:ci .
+        working-directory: src/problem5
+
+      # Logs are the only evidence available when a CI failure cannot be
+      # reproduced locally, and they are gone the moment the runner is torn
+      # down.
+      - name: Dump infrastructure logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

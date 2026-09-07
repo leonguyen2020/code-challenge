@@ -28,10 +28,31 @@ export interface ProblemDocument {
   readonly [extension: string]: unknown;
 }
 
+/**
+ * Turns a zod issue into a message that never quotes the submitted value.
+ *
+ * Zod's default text for a failed enum is
+ * `Invalid enum value. Expected 'a' | 'b', received 'WHATEVER_WAS_SENT'` - it
+ * echoes attacker-controlled input straight into the response body *and* into
+ * the log line the error handler writes. That is the same class of problem
+ * `requestContext` already guards against for `X-Request-Id`: unvalidated
+ * input reaching a log is how forged entries and control characters get in.
+ *
+ * Rewriting it here rather than passing an `errorMap` to each schema keeps the
+ * guarantee central - a schema added later cannot forget it - and is what lets
+ * `FieldIssue.message` promise it carries no submitted value.
+ */
+function safeIssueMessage(issue: ZodError['issues'][number]): string {
+  if (issue.code === 'invalid_enum_value') {
+    return `must be one of: ${issue.options.map(String).join(', ')}`;
+  }
+  return issue.message;
+}
+
 function zodToFieldIssues(error: ZodError): FieldIssue[] {
   return error.issues.map((issue) => ({
     path: issue.path.join('.') || '(root)',
-    message: issue.message,
+    message: safeIssueMessage(issue),
   }));
 }
 

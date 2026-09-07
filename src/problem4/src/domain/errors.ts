@@ -131,6 +131,19 @@ export class NegativeInputRejectedError extends SummationError {
 /**
  * The input is valid for the domain but beyond what this particular strategy
  * can compute in reasonable time or stack space.
+ *
+ * **Unreachable through `sum_to_n_a/b/c`, by construction.** All three shipped
+ * strategies set `maxSupportedInput = MAX_SAFE_N`, which is exactly the bound
+ * `SafeIntegerValidator` already enforces, so the guard in `SummationService`
+ * can never fire for them. That is deliberate rather than an oversight: the
+ * limit exists for *custom* strategies supplied through
+ * `new SummationService({ strategy })` - an O(n) implementation on a request
+ * path might reasonably cap itself far lower than the domain does, and the
+ * service enforces whatever cap the strategy declares.
+ *
+ * It is documented here so the guard is not mistaken for a live defence of the
+ * three public functions. Their defence is the validator; this is the seam that
+ * lets someone tighten it.
  */
 export class ExceedsStrategyLimitError extends SummationError {
   public readonly code = 'ERR_EXCEEDS_STRATEGY_LIMIT' as const;

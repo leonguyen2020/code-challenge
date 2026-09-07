@@ -105,25 +105,39 @@ function main(): void {
     );
   }
 
-  const ratioFor = (name: string): string => {
+  const growthOf = (name: string): { ratio: number; span: number } => {
     const subset = rows.filter((row) => row.strategy === name);
     const cheapest = Math.min(...subset.map((row) => row.nanosPerCall));
     const dearest = Math.max(...subset.map((row) => row.nanosPerCall));
     const span = Math.max(...subset.map((r) => r.n)) / Math.min(...subset.map((r) => r.n));
-    return `${(dearest / cheapest).toFixed(1).padStart(12)}x  over a ${span.toLocaleString('en-US')}x input range`;
+    return { ratio: dearest / cheapest, span };
   };
 
   console.log('\ncost growth from the smallest to the largest input measured:');
   // Derived from the rows themselves rather than a hand-maintained list, so
   // adding a strategy cannot leave this summary silently incomplete - and the
   // labels cannot drift out of sync with the strategy names again.
-  for (const name of [...new Set(rows.map((row) => row.strategy))]) {
-    console.log(`  ${name.padEnd(22)}${ratioFor(name)}`);
+  const strategies = [...new Set(rows.map((row) => row.strategy))];
+  for (const name of strategies) {
+    const { ratio, span } = growthOf(name);
+    console.log(
+      `  ${name.padEnd(22)}${ratio.toFixed(1).padStart(12)}x  over a ` +
+        `${span.toLocaleString('en-US')}x input range`,
+    );
   }
+
+  // The closing summary is derived too. It previously hard-coded "~19x" - a
+  // figure measured on one machine, printed directly beneath a table that had
+  // just computed a different number on this one. A hand-maintained number
+  // sitting under a generated one is the drift this whole block exists to
+  // avoid.
+  const halving = growthOf('halving-recursion');
   console.log(
-    '\nThe closed form is flat. Halving grows logarithmically - a ~19x cost rise\n' +
-      'across a 13,400,000x input range. The iterative one tracks the input size\n' +
-      'directly. O(1) vs O(log n) vs O(n), measured rather than asserted.\n',
+    `\nThe closed form is flat. Halving grows logarithmically - a ` +
+      `~${halving.ratio.toFixed(0)}x cost rise across a ` +
+      `${halving.span.toLocaleString('en-US')}x input range. The iterative one ` +
+      `tracks the input\nsize directly. O(1) vs O(log n) vs O(n), measured ` +
+      `rather than asserted.\n`,
   );
 }
 

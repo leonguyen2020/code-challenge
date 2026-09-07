@@ -6,6 +6,7 @@ import {
   productIdParamSchema,
   updateProductSchema,
 } from '../../src/interfaces/http/schemas/product';
+import { PRICE_MINOR_MAX } from '../../src/domain/product/constraints';
 
 const VALID = {
   sku: 'BEV-COLA-330',
@@ -115,6 +116,33 @@ describe('listProductsQuerySchema', () => {
     expect(() => listProductsQuerySchema.parse({ minPrice: '1.5' })).toThrow();
   });
 
+  it('rejects a numeric parameter too large to be exact, rather than passing it to the driver', () => {
+    // `/^\d+$/` bounds the *characters*, not the magnitude. Without the
+    // safe-integer guard these reach PostgreSQL as bigint literals that
+    // overflow the column (SQLSTATE 22003) and surface as a 500.
+    expect(() => listProductsQuerySchema.parse({ minPrice: '9223372036854775808' })).toThrow();
+    expect(() => listProductsQuerySchema.parse({ minPrice: '99999999999999999999' })).toThrow();
+    expect(() => listProductsQuerySchema.parse({ maxPrice: '99999999999999999999' })).toThrow();
+  });
+
+  it('caps a price bound at the same ceiling the column has', () => {
+    expect(listProductsQuerySchema.parse({ minPrice: String(PRICE_MINOR_MAX) }).minPrice)
+      .toBe(PRICE_MINOR_MAX);
+    expect(() => listProductsQuerySchema.parse({ minPrice: String(PRICE_MINOR_MAX + 1) })).toThrow();
+  });
+
+  it('requires a search term long enough for the trigram index to serve', () => {
+    // Two characters produce no extractable trigram for `ILIKE '%xx%'`, so the
+    // GIN index is skipped and the query becomes a sequential scan.
+    expect(() => listProductsQuerySchema.parse({ q: 'ab' })).toThrow();
+    expect(listProductsQuerySchema.parse({ q: 'abc' }).q).toBe('abc');
+  });
+
+  it('bounds the cursor length like every other string in the query', () => {
+    expect(() => listProductsQuerySchema.parse({ cursor: 'A'.repeat(513) })).toThrow();
+    expect(listProductsQuerySchema.parse({ cursor: 'A'.repeat(512) }).cursor).toHaveLength(512);
+  });
+
   it('rejects an inverted price range', () => {
     expect(() => listProductsQuerySchema.parse({ minPrice: '100', maxPrice: '50' })).toThrow();
     expect(listProductsQuerySchema.parse({ minPrice: '50', maxPrice: '100' }).minPrice).toBe(50);
@@ -153,7 +181,7 @@ describe('listProductsQuerySchema', () => {
   it('enforces the search term length bounds', () => {
     expect(() => listProductsQuerySchema.parse({ q: 'a' })).toThrow();
     expect(() => listProductsQuerySchema.parse({ q: 'a'.repeat(101) })).toThrow();
-    expect(listProductsQuerySchema.parse({ q: 'ab' }).q).toBe('ab');
+    expect(listProductsQuerySchema.parse({ q: 'abc' }).q).toBe('abc');
   });
 });
 

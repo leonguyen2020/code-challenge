@@ -6,6 +6,27 @@
 | [5](src/problem5) | A Crude Server (ExpressJS + TypeScript CRUD) | ✅ Complete |
 | [6](src/problem6) | Architecture (live scoreboard specification) | ✅ Complete |
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs everything this
+repository claims, on every push and pull request — a gate that only runs when
+somebody remembers to run it is not a gate.
+
+| | Problem 4 | Problem 5 |
+|---|---|---|
+| Strict typecheck | ✅ | ✅ |
+| Test suite + 100% coverage gate | ✅ | ✅ |
+| Full-domain heavy tests | ✅ | — |
+| `npm audit` | ✅ | ✅ |
+| Compose stack + 31 infra/security checks | — | ✅ |
+| Migration applied **and reverted** | — | ✅ |
+| Compiled build + container image | — | ✅ |
+
+Problem 5's job brings up the repository-root Compose stack rather than using
+GitHub's `services:` containers, so CI exercises the same hardened environment a
+developer runs locally — and `scripts/verify-infra.sh` becomes an enforced gate
+rather than a documented one.
+
 ---
 
 ## Local infrastructure
@@ -93,7 +114,7 @@ npm install && npm run migration:run && npm run seed
 npm run dev                          # http://localhost:3000
 ```
 
-**216 tests — 140 unit, 76 integration against a real PostgreSQL — 100%
+**224 tests — 145 unit, 79 integration against a real PostgreSQL — 100%
 statements, branches, functions and lines.** `npm audit`: 0 vulnerabilities.
 
 Exactly the five operations the brief asks for. The engineering is in how they

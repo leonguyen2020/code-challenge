@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  CURSOR_MAX_LENGTH,
   DESCRIPTION_MAX_LENGTH,
   LIST_LIMIT_DEFAULT,
   LIST_LIMIT_MAX,
@@ -45,11 +46,34 @@ const booleanQueryParam = z
  * `z.coerce.number()` accepts `''` as 0 and `'  12  '` as 12, so a missing
  * parameter sent as `?minPrice=` would become a real filter of `>= 0`. The
  * regex guard requires actual digits before coercion runs.
+ *
+ * The safe-integer refinement is the other half, and it is not cosmetic:
+ * `/^\d+$/` puts no limit on how *many* digits arrive, so
+ * `?minPrice=99999999999999999999` parses to `1e20`, is serialised for
+ * PostgreSQL as `100000000000000000000`, and overflows the `bigint` column
+ * with SQLSTATE 22003. That surfaces as an unrecognised driver error and
+ * therefore a **500** - for input that is plainly the caller's mistake.
+ * Rejecting it here keeps the failure a 400, which is what it is.
  */
 const integerQueryParam = z
   .string()
   .regex(/^\d+$/, 'must be a non-negative integer')
-  .transform(Number);
+  .transform(Number)
+  .refine(Number.isSafeInteger, 'must be within the exactly representable range');
+
+/**
+ * A price bound, capped at the same ceiling the column is capped at.
+ *
+ * A filter above `PRICE_MINOR_MAX` cannot match any row the API would ever
+ * have accepted, so it returns an empty page and reads as "no results" rather
+ * than "you asked for something impossible". This is the same reasoning the
+ * inverted-range check below applies: turn a silent surprise into an explicit
+ * 400.
+ */
+const priceQueryParam = integerQueryParam.refine(
+  (value) => value <= PRICE_MINOR_MAX,
+  { message: `must be at most ${PRICE_MINOR_MAX}` },
+);
 
 /**
  * A name that is not merely present but meaningful.
@@ -176,8 +200,8 @@ export const listProductsQuerySchema = z
   .object({
     category: z.enum(PRODUCT_CATEGORIES).optional(),
     currency: z.enum(SUPPORTED_CURRENCIES).optional(),
-    minPrice: integerQueryParam.optional(),
-    maxPrice: integerQueryParam.optional(),
+    minPrice: priceQueryParam.optional(),
+    maxPrice: priceQueryParam.optional(),
     inStock: booleanQueryParam.optional(),
     isActive: booleanQueryParam.optional(),
     q: z.string().trim().min(SEARCH_TERM_MIN_LENGTH).max(SEARCH_TERM_MAX_LENGTH).optional(),
@@ -187,7 +211,7 @@ export const listProductsQuerySchema = z
         message: `must be between ${LIST_LIMIT_MIN} and ${LIST_LIMIT_MAX}`,
       })
       .optional(),
-    cursor: z.string().min(1).optional(),
+    cursor: z.string().min(1).max(CURSOR_MAX_LENGTH).optional(),
   })
   .strict()
   // An inverted price range returns an empty page and looks like "no results"
