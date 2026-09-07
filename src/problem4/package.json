@@ -1,0 +1,29 @@
+{
+  "name": "@code-challenge/problem4",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Problem 4 - Three ways to sum to n. Strategy-based, input-validated, overflow-safe.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist coverage *.tsbuildinfo",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "bench": "tsc --build && node dist/benchmark.js",
+    "test:heavy": "RUN_HEAVY_TESTS=1 jest tests/heavy.spec.ts"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.0.0",
+    "@types/node": "^22.10.0",
+    "jest": "^30.0.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.2"
+  }
+}
